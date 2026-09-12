@@ -1,0 +1,27 @@
+# generated data and results
+raw/
+graph*/
+runs/
+hf_out/
+*.npz
+*.pt
+data/**/*.bin
+data/**/*.npy
+data/**/*.parquet
+data/**/*.txt
+data/**/*.zst
+data/**/meta.json
+data/**/tokenizer.json
+data/pairs/*.jsonl
+!data/pairs/pairs_demo.jsonl
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store

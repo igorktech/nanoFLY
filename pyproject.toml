@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanofly"
+version = "0.1.0"
+description = "A fruit-fly connectome (MaleCNS v1.0) as the recurrent layer of a language model"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["torch>=2.2", "numpy", "tokenizers"]
+
+[project.optional-dependencies]
+hf = ["transformers>=4.45", "safetensors", "huggingface_hub"]
+encoder = ["sentence-transformers>=3.3"]
+data = ["pandas", "pyarrow", "scipy", "certifi", "zstandard"]
+vision = ["pillow"]
+dev = ["nanofly[hf,encoder,data]"]
+
+[project.urls]
+Homepage = "https://github.com/igorktech/nanoFLY"
+
+[tool.setuptools.packages.find]
+include = ["nanofly*"]
