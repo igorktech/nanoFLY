@@ -23,6 +23,18 @@ from transformers.utils import ModelOutput
 
 from .configuration_replyfly import ReplyflyConfig
 
+# This file is the single source for both published variants. `export_hf.py::write_code` ships it
+# unchanged for the encoder-decoder and, for the decoder, rewrites the `Replyfly` prefix to `Fly`
+# and drops the conditional tail, which starts at the top-level definition of `_hash_embed` and runs
+# to the end of the file. Three invariants:
+#   1. the prefix is spelled `Replyfly` (class) and `replyfly` (module) nowhere except where it must
+#      be renamed — never put either literal in a URL or a message meant to survive;
+#   2. everything below that definition belongs to the post channel, and nothing above it refers to
+#      anything below;
+#   3. the relative import above is rewritten too, so the pair always travels together.
+# The export writes the folder, loads it back and compares logits, so a broken rename fails loudly —
+# as it did the first time this very comment was written with the marker spelled out in full.
+
 
 class ReplyflyCache:
     """What carries over between generate() steps: neuron state and the delay line of token ids."""

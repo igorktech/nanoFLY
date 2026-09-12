@@ -14,7 +14,9 @@ Tokens enter the sensory neurons through a delay line of `delay` groups, the pos
 constant current into `news_group` (olfactory ORNs by default), and the output is read from the
 `readout` neurons (all, dn, motor, dn+motor, dn+motor+ascending).
 """
+import hashlib
 import math
+import warnings
 from dataclasses import asdict, dataclass, fields
 
 import numpy as np
@@ -59,6 +61,7 @@ class FlyConfig:
     seed: int = 0
     graph_n: int = 0
     graph_e: int = 0
+    graph_sha: str = ""
 
     @classmethod
     def from_dict(cls, d):
@@ -165,13 +168,15 @@ def _sddmm(S, values, gy, x):
     return g
 
 class FlyLM(nn.Module):
-    def __init__(self, cfg: FlyConfig, graph: dict):
+    def __init__(self, cfg: FlyConfig, graph: dict, token_idx=None):
         super().__init__()
         self.cfg = cfg
         rng = np.random.default_rng(cfg.seed)
+        token_idx_override = token_idx
         n = len(graph["nt"])
         cfg.graph_n = n
 
+        cfg.graph_sha = graph_sha(graph)
         sign = neuron_signs(graph, cfg.modulatory_sign)
         pre, post, cnt = graph["pre"].astype(np.int64), graph["post"].astype(np.int64), graph["count"].astype(np.float64)
         keep = cnt >= cfg.min_syn
@@ -204,17 +209,29 @@ class FlyLM(nn.Module):
         elif cfg.mode != "gains":
             raise ValueError(f"unknown mode {cfg.mode}")
 
+        # The post channel is carved out of the sensory population whether or not this model uses
+        # it, so a decoder and an encoder-decoder built on the same graph get the same token input
+        # and the same `in_proj` layout — which is what lets one initialise the other. Anything
+        # that consumes `rng` before the permutation below re-maps every row of `in_proj`, so do
+        # not insert draws here without invalidating old checkpoints.
         sensory = token_population(graph, cfg.token_input)
-        news_idx = np.zeros(0, dtype=np.int64)
-        if cfg.news_dim > 0:
-            news_idx = group(graph, cfg.news_group)
-            if len(news_idx) < cfg.news_min_neurons:
-                k = max(cfg.news_min_neurons, len(sensory) // 7)
-                news_idx = np.sort(rng.choice(sensory, size=min(k, len(sensory) // 2), replace=False))
-        token_idx = np.setdiff1d(sensory, news_idx)
+        reserved = group(graph, cfg.news_group)
+        if len(reserved) < cfg.news_min_neurons:
+            k = max(cfg.news_min_neurons, len(sensory) // 7)
+            reserved = np.sort(rng.choice(sensory, size=min(k, len(sensory) // 2), replace=False))
+        news_idx = reserved if cfg.news_dim > 0 else np.zeros(0, dtype=np.int64)
+        token_idx = np.setdiff1d(sensory, reserved)
         if len(token_idx) < cfg.delay:
             raise ValueError("too few sensory neurons for the token input")
         token_idx = rng.permutation(token_idx)
+        if token_idx_override is not None:
+            override = np.asarray(token_idx_override, dtype=np.int64)
+            if not np.array_equal(np.sort(override), np.sort(token_idx)):
+                raise ValueError("the stored token population is not the one this graph and config "
+                                 "produce; --graph, --token-input, --news-group and the graph seed "
+                                 "must match the checkpoint")
+            token_idx = override
+        self.n_reserved = len(reserved)
         bounds = np.linspace(0, len(token_idx), cfg.delay + 1).astype(int)
         self.group_bounds = [(int(bounds[j]), int(bounds[j + 1])) for j in range(cfg.delay)]
 
@@ -351,6 +368,7 @@ class FlyLM(nn.Module):
 
     def describe(self):
         groups = {"token input": len(self.token_idx), "post input": len(self.news_idx),
+                  "reserved": self.n_reserved,
                   "photoreceptors": len(self.photo_idx), "readout": len(self.readout_idx), "DN": len(self._dn)}
         if self.cfg.news_glom:
             groups["glomeruli"] = self.cfg.news_glom
@@ -366,15 +384,76 @@ class FlyLM(nn.Module):
         return "\n".join(lines)
 
 
+def graph_sha(graph):
+    """Identity of the wiring itself. Edge counts alone cannot tell two graphs apart."""
+    h = hashlib.sha256()
+    for key in ("pre", "post", "count", "nt"):
+        h.update(np.ascontiguousarray(graph[key]).tobytes())
+    return h.hexdigest()
+
+
+def token_idx_sha(token_idx):
+    """Identity of the input layout: which neuron holds which row of `in_proj`, in order."""
+    a = token_idx.detach().cpu().numpy() if torch.is_tensor(token_idx) else np.asarray(token_idx)
+    return hashlib.sha256(np.ascontiguousarray(a, dtype=np.int64).tobytes()).hexdigest()
+
+
 def save_checkpoint(path, model, extra):
-    torch.save({"cfg": asdict(model.cfg), "state_dict": model.state_dict(), **extra}, path)
+    """Parameters only: every graph buffer is `persistent=False` and is rebuilt from `--graph`. The
+    token layout travels with the weights because it is a numpy permutation, and numpy does not
+    promise a stable stream across versions."""
+    torch.save({"cfg": asdict(model.cfg), "state_dict": model.state_dict(),
+                "token_idx": model.token_idx.cpu().numpy(),
+                "token_idx_sha": token_idx_sha(model.token_idx), **extra}, path)
 
 
 def load_checkpoint(path, graph, device="cpu"):
     ck = torch.load(path, map_location="cpu", weights_only=False)
     cfg = FlyConfig.from_dict(ck["cfg"])
-    model = FlyLM(cfg, graph)
-    if model.cfg.graph_e != ck["cfg"].get("graph_e", model.cfg.graph_e):
-        raise ValueError("the graph does not match the one the model was trained on (different edge count)")
+    model = FlyLM(cfg, graph, token_idx=ck.get("token_idx"))
+    for key, label in (("graph_e", "edge count"), ("graph_n", "neuron count"), ("graph_sha", "wiring")):
+        want = ck["cfg"].get(key)
+        if want and getattr(model.cfg, key) != want:
+            raise ValueError(f"the graph does not match the one the model was trained on ({label})")
     model.load_state_dict(ck["state_dict"])
     return model.to(device), ck
+
+
+# Everything below the architecture line has to agree for one checkpoint to initialise another;
+# `ticks` only changes the dynamics, so it is a warning rather than a refusal.
+MUST_MATCH = ["vocab_size", "d_emb", "delay", "mode", "readout", "readout_rank"]
+
+
+def init_from_checkpoint(model, ck, tokenizer_sha=None):
+    """Load the parameters of one model into another — a decoder into an encoder-decoder, typically.
+
+    Refuses anything that would quietly produce a different brain: another graph, another input
+    layout, another vocabulary. Returns which tensors were taken, which stayed freshly initialised
+    and which were left behind.
+    """
+    cfg = ck["cfg"]
+    for key, label in (("graph_n", "neuron count"), ("graph_e", "edge count"), ("graph_sha", "wiring")):
+        want = cfg.get(key)
+        if want and getattr(model.cfg, key) != want:
+            raise ValueError(f"--init-from: the checkpoint was trained on a different graph ({label})")
+    if ck.get("token_idx_sha") and ck["token_idx_sha"] != token_idx_sha(model.token_idx):
+        raise ValueError("--init-from: different token population; --graph, --token-input, "
+                         "--news-group and the graph seed must match the checkpoint")
+    if tokenizer_sha and ck.get("tokenizer_sha") and ck["tokenizer_sha"] != tokenizer_sha:
+        raise ValueError("--init-from: different tokenizer; the embedding and the head are bound to "
+                         "the vocabulary, pass --tokenizer from the checkpoint's run")
+    for key in MUST_MATCH:
+        if cfg.get(key) is not None and cfg[key] != getattr(model.cfg, key):
+            raise ValueError(f"--init-from: {key} is {cfg[key]} in the checkpoint, "
+                             f"{getattr(model.cfg, key)} here")
+    if cfg.get("ticks") != model.cfg.ticks:
+        warnings.warn(f"--init-from: ticks {cfg.get('ticks')} -> {model.cfg.ticks}; the weights load "
+                      "but the dynamics they were trained for are different")
+
+    own, sd = model.state_dict(), ck["state_dict"]
+    bad = [k for k, v in sd.items() if k in own and own[k].shape != v.shape]
+    if bad:
+        raise ValueError(f"--init-from: shape mismatch on {bad}")
+    take = {k: v for k, v in sd.items() if k in own}
+    missing = model.load_state_dict(take, strict=False).missing_keys
+    return {"loaded": sorted(take), "fresh": sorted(missing), "ignored": sorted(set(sd) - set(own))}

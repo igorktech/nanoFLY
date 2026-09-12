@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Train fly-LM on "post -> reply" pairs.
+Train nanoFLY: a connectome reservoir language model.
 
-Data: JSONL, one example per line: {"news": "the post", "text": "a short reply"}.
-A .txt file also works (one line = one text, no posts).
+Two shapes of data:
+  a prepared directory   data/<name>/prepare.py wrote train.bin / val.bin / tokenizer.json
+  a JSONL or text file   {"news": "the post", "text": "a short reply"} per line, or one text per line
 
 Examples:
-  python train.py --graph graph/graph.npz --data pairs.jsonl --out runs/gains
-  python train.py --graph graph/graph.npz --data pairs.jsonl --out runs/edges --mode edges --readout dn+motor
-  python train.py --graph graph_synth/graph.npz --data demo.jsonl --out /tmp/t --news-encoder hash --max-steps 20
+  python data/tinystories/prepare.py --out data/tinystories --limit 10000
+  python train.py --graph graph_cb/graph.npz --data data/tinystories --out runs/A --arch decoder
+  python train.py --graph graph_cb/graph.npz --data data/pairs/pairs.jsonl --out runs/B \
+      --arch encoder-decoder --init-from runs/A/ckpt.pt
 """
 import argparse
-import hashlib
-import json
 import math
 import os
-import random
-import shutil
 import time
 import warnings
 
@@ -24,71 +22,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from nanofly.encoders import load_news_encoder
-from nanofly.model import (BOS, EOS, PAD, SPECIAL_TOKENS, FlyConfig, FlyLM, load_graph,
-                           save_checkpoint)
+from nanofly.data import (CHAR_ALPHABET, batch_context, file_sha256, load_data, make_batches,
+                          news_embeddings, pad_batch)
+from nanofly.model import PAD, FlyConfig, FlyLM, load_graph, save_checkpoint
 
 warnings.filterwarnings("ignore", message=".*Sparse CSR tensor support is in beta.*")
-
-
-def read_data(path, text_field, news_field, limit):
-    texts, news = [], []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if path.endswith(".jsonl") or path.endswith(".json"):
-                obj = json.loads(line)
-                t = str(obj.get(text_field, "")).strip()
-                if not t:
-                    continue
-                texts.append(t)
-                news.append(str(obj.get(news_field, "") or "").strip())
-            else:
-                texts.append(line)
-                news.append("")
-            if limit and len(texts) >= limit:
-                break
-    return texts, news
-
-
-CHAR_ALPHABET = "abcdefghijklmnopqrstuvwxyz .,'?!-"
-
-
-def char_tokenizer(alphabet):
-    """Character vocabulary: every output is a whole character, no truncated bytes."""
-    from tokenizers import Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
-    vocab = {t: i for i, t in enumerate(SPECIAL_TOKENS + ["<unk>"] + list(dict.fromkeys(alphabet)))}
-    tok = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
-    tok.normalizer = normalizers.Sequence([normalizers.NFKC(), normalizers.Lowercase()])
-    tok.pre_tokenizer = pre_tokenizers.Split(Regex(""), behavior="isolated")
-    tok.decoder = decoders.Fuse()
-    return tok
-
-
-def get_tokenizer(path, texts, vocab_size, kind="bpe", alphabet=CHAR_ALPHABET):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
-    if path and os.path.exists(path):
-        return Tokenizer.from_file(path)
-    if kind == "char":
-        tok = char_tokenizer(alphabet)
-        unknown = sorted({c for t in texts for c in t.lower() if tok.token_to_id(c) is None})
-        if unknown:
-            print(f"{len(unknown)} characters outside the alphabet become <unk>: {''.join(unknown[:40])}")
-        if path:
-            tok.save(path)
-        return tok
-    tok = Tokenizer(models.BPE(unk_token=None))
-    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tok.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS,
-                                  initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), show_progress=False)
-    tok.train_from_iterator(texts, trainer=trainer)
-    assert [tok.token_to_id(s) for s in SPECIAL_TOKENS] == [PAD, BOS, EOS]
-    if path:
-        tok.save(path)
-    return tok
 
 
 def vision_currents(news, graph, mode, args):
@@ -113,41 +51,9 @@ def vision_currents(news, graph, mode, args):
     return cur, np.array([index[s] for s in news]), lay
 
 
-def news_embeddings(news, encoder_name, cache_dir, device):
-    uniq = sorted(set(news))
-    if not encoder_name or encoder_name == "none" or uniq == [""]:
-        return None, None, 0
-    key = hashlib.md5(("\n".join(uniq) + encoder_name).encode()).hexdigest()[:12]
-    cache = os.path.join(cache_dir, f"news_{key}.npy")
-    if os.path.exists(cache):
-        emb = np.load(cache)
-    else:
-        enc = load_news_encoder(encoder_name, device)
-        print(f"encoding {len(uniq):,} unique posts with {encoder_name}")
-        emb = enc.encode(uniq)
-        np.save(cache, emb)
-    index = {s: i for i, s in enumerate(uniq)}
-    return emb, np.array([index[s] for s in news]), emb.shape[1]
-
-
-def make_batches(lengths, batch_size, seed):
-    rng = random.Random(seed)
-    order = sorted(range(len(lengths)), key=lambda i: lengths[i] + rng.random() * 3)
-    batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
-    rng.shuffle(batches)
-    return batches
-
-
-def pad_batch(seqs, idx, seq_len):
-    L = max(len(seqs[i]) for i in idx)
-    L = int(math.ceil((L - 1) / seq_len) * seq_len) + 1
-    out = np.full((len(idx), L), PAD, dtype=np.int64)
-    for r, i in enumerate(idx):
-        out[r, :len(seqs[i])] = seqs[i]
-    return torch.from_numpy(out)
-
-
 def run_batch(model, ids, news, seq_len, device, train=True, opt=None, sched=None, clip=1.0, vision=None):
+    """One batch, truncated backpropagation through time: the reservoir state carries across the
+    `seq_len` windows, the optimiser steps on each one, and only the state crosses the boundary."""
     ids = ids.to(device)
     B, L = ids.shape
     state = model.init_state(B, device)
@@ -175,63 +81,85 @@ def run_batch(model, ids, news, seq_len, device, train=True, opt=None, sched=Non
     return total, count
 
 
-def batch_context(idx, news_emb, news_idx, vis_cur, device):
-    news = torch.from_numpy(news_emb[news_idx[idx]]).to(device) if news_emb is not None else None
-    vis = torch.from_numpy(vis_cur[news_idx[idx]]).to(device) if vis_cur is not None else None
-    return news, vis
-
-
-def evaluate(model, seqs, news_idx, news_emb, idx_list, args, device, vis_cur=None):
+def evaluate(model, stream, news_emb, args, device, vis_cur=None):
     model.eval()
     total, count = 0.0, 0
-    for b in make_batches([len(seqs[i]) for i in idx_list], args.batch, 0):
-        idx = [idx_list[i] for i in b]
-        news, vis = batch_context(idx, news_emb, news_idx, vis_cur, device)
-        t, c = run_batch(model, pad_batch(seqs, idx, args.seq), news, args.seq, device, train=False, vision=vis)
+    for b in make_batches(stream.lengths, args.batch, 0):
+        news, vis = batch_context(b, news_emb, stream.news_idx, vis_cur, device)
+        t, c = run_batch(model, pad_batch(stream, b, args.seq), news, args.seq, device,
+                         train=False, vision=vis)
         total, count = total + t, count + c
     model.train()
     return total / max(count, 1)
 
 
+# Flags that describe the model rather than the run. With --init-from they default to the values in
+# the checkpoint, so a fine-tune cannot silently build a different brain than the one it loads.
+ARCH_FLAGS = ["d_emb", "delay", "ticks", "mode", "readout", "rank", "token_input", "news_group",
+              "min_syn", "modulatory_sign", "vocab", "vocab_type"]
+ARCH_DEFAULTS = {"d_emb": 256, "delay": 8, "ticks": 2, "mode": "gains", "readout": "all", "rank": 256,
+                 "token_input": "cb_sensory,visual_projection", "news_group": "orn", "min_syn": 1,
+                 "modulatory_sign": 0.0, "vocab": 1024, "vocab_type": "bpe"}
+# name in the checkpoint's cfg, when it differs from the flag
+CFG_NAME = {"rank": "readout_rank", "vocab": "vocab_size"}
+
+
+def resolve_arch(args, ck_cfg):
+    """Fill the architecture flags the user did not pass: from the checkpoint when fine-tuning,
+    from the defaults otherwise."""
+    for flag in ARCH_FLAGS:
+        if getattr(args, flag) is not None:
+            continue
+        value = ARCH_DEFAULTS[flag]
+        if ck_cfg is not None:
+            value = ck_cfg.get(CFG_NAME.get(flag, flag), value)
+        setattr(args, flag, value)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--graph", required=True)
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--data", required=True, help="a prepared directory or a .jsonl/.txt file")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--init-from", default="",
+                    help="checkpoint to start from; the architecture and tokenizer come from it")
     ap.add_argument("--text-field", default="text")
     ap.add_argument("--news-field", default="news")
-    ap.add_argument("--tokenizer", default="", help="existing tokenizer.json; without it a BPE is trained on the texts")
-    ap.add_argument("--vocab", type=int, default=2048, help="vocabulary size for bpe")
-    ap.add_argument("--vocab-type", default="bpe", choices=["bpe", "char"])
+    ap.add_argument("--tokenizer", default="", help="existing tokenizer.json; defaults to the one "
+                                                    "next to --data or --init-from")
+    ap.add_argument("--vocab", type=int, default=None, help="vocabulary size when training a bpe")
+    ap.add_argument("--vocab-type", default=None, choices=["bpe", "char"])
     ap.add_argument("--alphabet", default=CHAR_ALPHABET, help="alphabet for --vocab-type char")
     ap.add_argument("--arch", default="encoder-decoder", choices=["decoder", "encoder-decoder"],
                     help="decoder: tokens only, like ngxson/fly-llm-hf. "
                          "encoder-decoder: the post is encoded and fed into the ORNs")
-    ap.add_argument("--news-encoder", default="intfloat/multilingual-e5-small",
+    ap.add_argument("--news-encoder", default="minishlab/potion-base-8M",
                     help="a sentence-transformers model, 'hash' for tests or 'none'")
-    ap.add_argument("--mode", default="gains", choices=["gains", "edges"])
-    ap.add_argument("--readout", default="all", help="all | dn | motor | dn+motor | dn+motor+ascending")
-    ap.add_argument("--token-input", default="cb_sensory",
-                    help="where the token delay line goes: a superclass list (cb_sensory), a group name "
-                         "(orn), or 'sensory' for every sensory neuron of the CNS")
-    ap.add_argument("--rank", type=int, default=256, help="readout rank when it is large (0 = full)")
-    ap.add_argument("--ticks", type=int, default=2)
-    ap.add_argument("--delay", type=int, default=8)
-    ap.add_argument("--d-emb", type=int, default=256)
-    ap.add_argument("--min-syn", type=int, default=1)
-    ap.add_argument("--modulatory-sign", type=float, default=0.0)
-    ap.add_argument("--news-group", default="orn")
-    ap.add_argument("--news-mode", default="direct", choices=["direct", "glomeruli"],
+    ap.add_argument("--mode", default=None, choices=["gains", "edges"])
+    ap.add_argument("--readout", default=None, help="all | dn | motor | dn+motor | dn+motor+ascending")
+    ap.add_argument("--token-input", default=None,
+                    help="where the token delay line goes: a superclass list "
+                         "(cb_sensory,visual_projection), a group name, or 'sensory' for the whole CNS")
+    ap.add_argument("--rank", type=int, default=None, help="readout rank when it is large (0 = full)")
+    ap.add_argument("--ticks", type=int, default=None)
+    ap.add_argument("--delay", type=int, default=None)
+    ap.add_argument("--d-emb", type=int, default=None)
+    ap.add_argument("--min-syn", type=int, default=None)
+    ap.add_argument("--modulatory-sign", type=float, default=None)
+    ap.add_argument("--news-group", default=None,
+                    help="the post channel; these neurons are kept out of the token input in every "
+                         "architecture, so a decoder and an encoder-decoder share one input layout")
+    ap.add_argument("--news-mode", default="glomeruli", choices=["direct", "glomeruli"],
                     help="glomeruli: the post becomes a pattern over glomeruli, ORNs of one type share a value")
     ap.add_argument("--vision", default="off", choices=["off", "banner", "glyph", "code"],
-                    help="feed the post as a picture on the photoreceptors instead of an ORN embedding")
+                    help="experimental: feed the post as a picture on the photoreceptors")
     ap.add_argument("--vision-width", type=int, default=128)
     ap.add_argument("--vision-height", type=int, default=32)
     ap.add_argument("--vision-zoom", type=float, default=1.0)
     ap.add_argument("--vision-scale", type=float, default=1.0)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--seq", type=int, default=32, help="TBPTT window length")
-    ap.add_argument("--max-len", type=int, default=160, help="truncate an example to this many tokens")
+    ap.add_argument("--max-len", type=int, default=320, help="truncate an example to this many tokens")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--lr-head", type=float, default=5e-4)
@@ -240,55 +168,76 @@ def main():
     ap.add_argument("--warmup", type=int, default=200)
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--val-limit", type=int, default=0, help="use at most this many validation examples")
+    ap.add_argument("--eval-every", type=int, default=0,
+                    help="validate and checkpoint every N steps, not only at the end of an epoch")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N batches (for smoke tests)")
     ap.add_argument("--log-every", type=int, default=20)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="torch init and the order of the data; the "
+                                                        "neuron layout follows the checkpoint when --init-from is used")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
+    if args.device.startswith("mps"):
+        raise SystemExit("torch has no sparse CSR matmul on MPS; use --device cpu")
     if args.arch == "decoder":
         args.news_encoder = "none"
     elif args.news_encoder == "none" and args.vision == "off":
         raise SystemExit("--arch encoder-decoder needs an encoder: pass --news-encoder "
                          "(or hash for a smoke test), or use --arch decoder")
 
+    init_ck = None
+    if args.init_from:
+        init_ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        if not args.tokenizer:
+            side = os.path.join(os.path.dirname(os.path.abspath(args.init_from)),
+                                init_ck.get("tokenizer", "tokenizer.json"))
+            if os.path.exists(side):
+                args.tokenizer = side
+    resolve_arch(args, init_ck["cfg"] if init_ck else None)
+
     torch.manual_seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
 
-    texts, news = read_data(args.data, args.text_field, args.news_field, args.limit)
-    print(f"examples: {len(texts):,}")
-    tok_path = args.tokenizer or os.path.join(args.out, "tokenizer.json")
-    tok = get_tokenizer(tok_path, texts, args.vocab, args.vocab_type, args.alphabet)
-    if os.path.abspath(tok_path) != os.path.abspath(os.path.join(args.out, "tokenizer.json")):
-        shutil.copy(tok_path, os.path.join(args.out, "tokenizer.json"))
-    seqs = [[BOS] + e.ids[:args.max_len - 2] + [EOS] for e in tok.encode_batch(texts)]
-    n_tokens = sum(len(s) - 1 for s in seqs)
-    chars = sum(len(t) for t in texts)
-    print(f"training tokens: {n_tokens:,}, vocabulary {tok.get_vocab_size()}, "
-          f"characters per token {chars / max(n_tokens, 1):.2f}")
+    train, val, tok, tok_path = load_data(args)
+    tok_sha = file_sha256(tok_path)
 
     graph = load_graph(args.graph)
     vis_cur = None
+    news_emb, news_dim = None, 0
+    posts = (train.news or []) + (val.news or []) if train.news is not None else []
     if args.vision != "off":
-        vis_cur, news_idx, _ = vision_currents(news, graph, args.vision, args)
-        news_emb, news_dim = None, 0
+        if not posts:
+            raise SystemExit("--vision needs posts: use a .jsonl file with a 'news' field")
+        vis_cur, idx, _ = vision_currents(posts, graph, args.vision, args)
+    elif posts:
+        news_emb, idx, news_dim = news_embeddings(posts, args.news_encoder, args.out, "cpu")
     else:
-        news_emb, news_idx, news_dim = news_embeddings(news, args.news_encoder, args.out, "cpu")
+        idx = None
+    if idx is not None:
+        train.news_idx, val.news_idx = idx[:len(train)], idx[len(train):]
+
     cfg = FlyConfig(vocab_size=tok.get_vocab_size(), d_emb=args.d_emb, delay=args.delay, ticks=args.ticks,
                     mode=args.mode, token_input=args.token_input, readout=args.readout,
-                    readout_rank=args.rank, news_dim=news_dim,
-                    news_group=args.news_group, news_mode=args.news_mode, min_syn=args.min_syn, modulatory_sign=args.modulatory_sign,
-                    vision=args.vision, seed=args.seed)
-    model = FlyLM(cfg, graph).to(device)
+                    readout_rank=args.rank, news_dim=news_dim, news_group=args.news_group,
+                    news_mode=args.news_mode, min_syn=args.min_syn,
+                    modulatory_sign=args.modulatory_sign, vision=args.vision,
+                    seed=init_ck["cfg"]["seed"] if init_ck else args.seed)
+    model = FlyLM(cfg, graph, token_idx=init_ck.get("token_idx") if init_ck else None).to(device)
     del graph
     print(model.describe())
 
-    rng = np.random.default_rng(args.seed)
-    perm = rng.permutation(len(seqs))
-    n_val = int(len(seqs) * args.val_frac) if len(seqs) > 50 else 0
-    val_idx, train_idx = perm[:n_val].tolist(), perm[n_val:].tolist()
+    if init_ck is not None:
+        from nanofly.model import init_from_checkpoint
+        report = init_from_checkpoint(model, init_ck, tok_sha)
+        print(f"init from {args.init_from}: loaded {len(report['loaded'])} tensors "
+              f"({', '.join(report['loaded'][:6])}{', …' if len(report['loaded']) > 6 else ''})")
+        if report["fresh"]:
+            print(f"  fresh: {', '.join(report['fresh'])}")
+        if report["ignored"]:
+            print(f"  ignored: {', '.join(report['ignored'])}")
 
     head_params = [p for n, p in model.named_parameters() if n.startswith("head.")]
     edge_params = [p for n, p in model.named_parameters() if n == "logw"]
@@ -298,8 +247,7 @@ def main():
     if edge_params:
         groups.append({"params": edge_params, "lr": args.lr_edges, "weight_decay": 0.0})
     opt = torch.optim.AdamW(groups)
-    chunks_per_epoch = sum(math.ceil((min(len(seqs[i]), args.max_len) - 1) / args.seq)
-                           for i in train_idx) / max(args.batch, 1)
+    chunks_per_epoch = float(np.ceil(np.maximum(train.lengths - 1, 1) / args.seq).sum()) / max(args.batch, 1)
     total_steps = max(1, int(chunks_per_epoch * args.epochs))
 
     def lr_lambda(step):
@@ -309,17 +257,33 @@ def main():
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * p))
 
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    extra = {"tokenizer": "tokenizer.json", "news_encoder": args.news_encoder if news_dim else "none",
+    extra = {"tokenizer": "tokenizer.json", "tokenizer_sha": tok_sha,
+             "news_encoder": args.news_encoder if news_dim else "none",
              "arch": "encoder_decoder" if news_dim else "decoder", "vision": args.vision,
-             "graph": os.path.abspath(args.graph), "args": vars(args)}
+             "graph": os.path.abspath(args.graph), "init_from": os.path.abspath(args.init_from)
+             if args.init_from else "", "args": vars(args)}
+    ckpt_path = os.path.join(args.out, "ckpt.pt")
+    best = float("inf")
+
+    def checkpoint(epoch, step):
+        nonlocal best
+        if not len(val):
+            save_checkpoint(ckpt_path, model, extra)
+            return
+        vl = evaluate(model, val, news_emb, args, device, vis_cur)
+        mark = ""
+        if vl < best:
+            best, mark = vl, "  *"
+            extra["val_loss"], extra["epoch"], extra["step"] = float(vl), epoch, step
+            save_checkpoint(ckpt_path, model, extra)
+        print(f"epoch {epoch} step {step}: val loss {vl:.3f}, ppl {math.exp(min(vl, 20)):.1f}{mark}", flush=True)
 
     step, t0, seen, run_loss, run_tok = 0, time.time(), 0, 0.0, 0
-    best = float("inf")
+    stop = False
     for epoch in range(args.epochs):
-        for b in make_batches([len(seqs[i]) for i in train_idx], args.batch, args.seed + epoch):
-            idx = [train_idx[i] for i in b]
-            nb, vb = batch_context(idx, news_emb, news_idx, vis_cur, device)
-            loss_sum, n_tok = run_batch(model, pad_batch(seqs, idx, args.seq), nb, args.seq, device,
+        for b in make_batches(train.lengths, args.batch, args.seed + epoch):
+            nb, vb = batch_context(b, news_emb, train.news_idx, vis_cur, device)
+            loss_sum, n_tok = run_batch(model, pad_batch(train, b, args.seq), nb, args.seq, device,
                                         train=True, opt=opt, sched=sched, clip=args.clip, vision=vb)
             step += 1
             seen += n_tok
@@ -327,25 +291,22 @@ def main():
             run_tok += n_tok
             if step % args.log_every == 0:
                 dt = time.time() - t0
-                print(f"epoch {epoch} step {step} loss {run_loss / max(run_tok, 1):.3f} "
-                      f"{seen / dt:,.0f} tok/s  rho {math.exp(model.log_rho.item()):.3f}", flush=True)
+                done = step / max(total_steps, 1)
+                eta = (dt / max(done, 1e-9) - dt) / 60
+                print(f"epoch {epoch} step {step}/{total_steps} loss {run_loss / max(run_tok, 1):.3f} "
+                      f"{seen / dt:,.0f} tok/s  rho {math.exp(model.log_rho.item()):.3f}  eta {eta:.0f}m",
+                      flush=True)
                 run_loss, run_tok = 0.0, 0
+            if args.eval_every and step % args.eval_every == 0:
+                checkpoint(epoch, step)
             if args.max_steps and step >= args.max_steps:
+                stop = True
                 break
-        if val_idx:
-            vl = evaluate(model, seqs, news_idx, news_emb, val_idx, args, device, vis_cur)
-            print(f"epoch {epoch}: val loss {vl:.3f}, ppl {math.exp(min(vl, 20)):.1f}")
-            if vl < best:
-                best = vl
-                extra["val_loss"] = float(vl)
-                extra["epoch"] = epoch
-                save_checkpoint(os.path.join(args.out, "ckpt.pt"), model, extra)
-        else:
-            save_checkpoint(os.path.join(args.out, "ckpt.pt"), model, extra)
-        if args.max_steps and step >= args.max_steps:
+        checkpoint(epoch, step)
+        if stop:
             break
     save_checkpoint(os.path.join(args.out, "last.pt"), model, extra)
-    print(f"done in {time.time() - t0:.0f} s, checkpoint {os.path.join(args.out, 'ckpt.pt')}")
+    print(f"done in {time.time() - t0:.0f} s, checkpoint {ckpt_path}")
 
 
 if __name__ == "__main__":

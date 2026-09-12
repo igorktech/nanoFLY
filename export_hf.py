@@ -64,9 +64,12 @@ def write_code(out_dir, variant):
         dst = src
         if names["prefix"] != "Replyfly":
             text = text.replace("Replyfly", names["prefix"]).replace("replyfly", names["module"])
-            cut = text.find("def _hash_embed(")
+            # a top-level definition, so prose mentioning the marker cannot cut the file short
+            cut = text.find("\ndef " + "_hash_embed(")
             if cut > 0:
                 text = text[:cut].rstrip() + "\n"
+            if "modeling" in src and f"class {names['prefix']}ForCausalLM" not in text:
+                raise SystemExit(f"write_code cut {src} short: no {names['prefix']}ForCausalLM left")
             dst = src.replace("replyfly", names["module"])
         with open(os.path.join(out_dir, dst), "w", encoding="utf-8") as f:
             f.write(text)
@@ -121,6 +124,8 @@ def build_config(model: FlyLM, ck: dict, arch: str, source_repo: str) -> Replyfl
         readout_rank=cfg.readout_rank,
         head_type="linear" if head_linear else "lowrank",
         news_dim=cfg.news_dim,
+        news_group=cfg.news_group,
+        n_reserved=getattr(model, "n_reserved", 0),
         news_mode=cfg.news_mode,
         news_glom=cfg.news_glom,
         news_encoder=encoder,
@@ -192,8 +197,8 @@ tags:
 - connectome
 - drosophila
 - reservoir
-- replyfly
----
+- nanofly
+{extra_tags}---
 
 # {name}
 
@@ -241,6 +246,7 @@ published next to the model, treat "the fly writes" as a demo, not a result.
 | architecture | `{arch}` |
 | mode | `{mode}` ({learned_short}) |
 | delay line | {delay} slots, {n_token_input:,} sensory neurons carry tokens |
+| post channel | {reserved_line} |
 | ticks per token | {ticks} |
 | vocabulary | {vocab_size:,} ({tokenizer_kind}) |
 | trainable parameters | {n_params_m:.1f}M |
@@ -300,6 +306,11 @@ def write_card(path, conf: ReplyflyConfig, ck: dict, hf, repo, name):
         connectome=conf.connectome, source_repo=conf.source_repo or "not recorded",
         usage=USAGE_COND if conf.conditional else USAGE_DECODER,
         arch_line=arch_line,
+        extra_tags="- replyfly\n" if conf.conditional else "",
+        reserved_line=(f"{conf.n_news_input:,} olfactory neurons, {conf.news_glom} glomeruli"
+                       if conf.conditional else
+                       f"none — the {conf.n_reserved:,} olfactory neurons are held out of the token "
+                       "input so the encoder-decoder variant can start from these weights"),
     )
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -349,6 +360,12 @@ def main():
     model.eval()
     del graph
 
+    vis = ck.get("vision", "off") or model.cfg.vision
+    if vis != "off":
+        raise SystemExit(f"this checkpoint was trained with --vision {vis}, and the shipped model has "
+                         "no photoreceptor input: the export would silently drop the post channel")
+    if str(ck.get("arch", "")).replace("-", "_") == "encoder_decoder" and not model.cfg.news_dim:
+        raise SystemExit("encoder-decoder checkpoint with no post channel; nothing to export")
     arch = ck.get("arch") or ("encoder_decoder" if model.cfg.news_dim else "decoder")
     arch = "encoder_decoder" if arch.replace("-", "_") == "encoder_decoder" else "decoder"
     name = args.name or os.path.basename(os.path.abspath(args.out))
@@ -402,7 +419,8 @@ def main():
         from huggingface_hub import HfApi
         api = HfApi()
         api.create_repo(args.push, private=args.private, exist_ok=True)
-        api.upload_folder(folder_path=args.out, repo_id=args.push, commit_message=f"replyfly {arch}")
+        api.upload_folder(folder_path=args.out, repo_id=args.push,
+                          commit_message=f"nanofly {arch}, {conf.n_neurons:,} neurons")
         print(f"pushed: https://huggingface.co/{args.push}")
 
 

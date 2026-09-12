@@ -42,6 +42,8 @@ class ReplyflyConfig(PretrainedConfig):
         readout_rank=256,
         head_type="lowrank",
         news_dim=0,
+        news_group="orn",
+        n_reserved=0,
         news_mode="direct",
         news_glom=0,
         news_encoder="none",
@@ -73,6 +75,8 @@ class ReplyflyConfig(PretrainedConfig):
         self.readout_rank = readout_rank
         self.head_type = head_type          # lowrank: Linear->LayerNorm->Linear, linear: LayerNorm->Linear
         self.news_dim = news_dim
+        self.news_group = news_group        # population carved out for the post channel
+        self.n_reserved = n_reserved        # its size, even when this variant does not use it
         self.news_mode = news_mode
         self.news_glom = news_glom
         self.news_encoder = news_encoder
