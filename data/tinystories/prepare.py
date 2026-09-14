@@ -38,16 +38,9 @@ def main():
     args = ap.parse_args()
 
     files = [VALIDATION] if args.split == "validation" else TRAIN_SHARDS[:max(1, args.shards)]
-    want, texts, used = args.limit, [], 0
-    for f in files:
-        if want and len(texts) >= want:
-            break
-        args.hf_file = f"{REPO}:{f}"
-        args.limit = want - len(texts) if want else 0
-        texts += collect(args)[0]
-        used += 1
-    args.limit = want
-    prepare(args, texts, f"{REPO} ({args.split}, {used} file(s))")
+    args.hf_file = [f"{REPO}:{f}" for f in files]
+    texts, source = collect(args)
+    prepare(args, texts, source)
 
 
 if __name__ == "__main__":

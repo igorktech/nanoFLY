@@ -16,6 +16,8 @@ constant current into `news_group` (olfactory ORNs by default), and the output i
 """
 import hashlib
 import math
+import os
+import tempfile
 import warnings
 from dataclasses import asdict, dataclass, fields
 
@@ -399,12 +401,23 @@ def token_idx_sha(token_idx):
 
 
 def save_checkpoint(path, model, extra):
-    """Parameters only: every graph buffer is `persistent=False` and is rebuilt from `--graph`. The
+    """Save learned parameters and caller metadata; graph buffers are rebuilt from `--graph`. The
     token layout travels with the weights because it is a numpy permutation, and numpy does not
-    promise a stable stream across versions."""
-    torch.save({"cfg": asdict(model.cfg), "state_dict": model.state_dict(),
-                "token_idx": model.token_idx.cpu().numpy(),
-                "token_idx_sha": token_idx_sha(model.token_idx), **extra}, path)
+    promise a stable stream across versions. Training may include optimizer/cursor state in extra."""
+    payload = {"cfg": asdict(model.cfg), "state_dict": model.state_dict(),
+               "token_idx": model.token_idx.cpu().numpy(),
+               "token_idx_sha": token_idx_sha(model.token_idx), **extra}
+    # A failed/interrupted write must leave the previous checkpoint intact.
+    fd, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            torch.save(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def load_checkpoint(path, graph, device="cpu"):

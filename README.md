@@ -74,9 +74,44 @@ python data/text/prepare.py --hf-file some/dataset:file.jsonl.zst --field text \
 ```
 
 `data/text/prepare.py` is the general one — the other two are wrappers. It reads `.txt`, `.jsonl`,
-`.jsonl.zst` and `.parquet`, from a local path, a URL or a Hub file, and stops at `--limit` records
-without downloading the rest. `--chunk N` cuts a long document into windows of N tokens, because a
-book is not one training example.
+`.jsonl.zst` and `.parquet`, from a local path, a URL or a Hub file. JSONL and paragraph text are
+streamed up to `--limit` documents; Hub parquet files are downloaded before their rows are streamed.
+Preparation spools text to temporary files under `--out`, so allow disk space for the unpacked text
+as well as the token files. RAM depends on the largest document and the bounded tokenizer sample,
+not the total corpus size. BPE uses a seeded reservoir of snippets of up to 2,048 characters, capped
+by both `--tok-limit` documents and `--tok-chars` characters (20 million by default).
+
+Repeat `--local`, `--url`, or `--hf-file` to combine sources under one tokenizer. For a weighted
+mixture, use `--mix mix.json` with a document budget (`--limit`):
+
+```json
+[
+  {"local": "raw/news.jsonl.zst", "field": "text", "weight": 2},
+  {"local": "raw/pikabu.jsonl.zst", "field": "text", "weight": 1, "limit": 500000}
+]
+```
+
+```bash
+python data/text/prepare.py --mix mix.json --limit 1000000 --vocab 4096 --out data/russian
+```
+
+Weights are relative probabilities per **document**, not token proportions. Sampling is without
+replacement; exhausted sources drop out and the remaining weights are renormalized. With no global
+limit, every source is consumed up to its own limit, so weights change order rather than final counts.
+Paths in a manifest are relative to the working directory. A seeded content hash assigns documents
+to train/validation before chunking, keeping exact duplicates in the same split. This does not remove
+duplicates or detect near-duplicate news. `--val-limit` discards excess held-out documents.
+
+By default whole documents are preserved. `--chunk N` makes independent examples of at most N tokens
+including BOS/EOS, covering all body tokens but resetting context between chunks. During training,
+`--max-len 0` (the default) keeps whole examples and carries state across TBPTT windows. A positive
+`--max-len` explicitly truncates examples and prints a warning with the number of discarded tokens.
+Chunking trades document context for smaller padded batches; TBPTT bounds the gradient window in
+either case.
+
+Prepared data must include `meta.json` with its tokenizer SHA-256. A different tokenizer, including
+one inherited through `--init-from`, is rejected even when vocabulary sizes match. To fine-tune on
+a new prepared corpus, prepare it with `--tokenizer runs/A/tokenizer.json` first.
 
 ## Train
 
@@ -95,8 +130,35 @@ refuses to start if any of them would differ — a different graph, a different 
 different vocabulary is an error, not a silent mismatch. Only the post projection is new.
 
 Training is truncated backpropagation through time: the reservoir state carries across `--seq`
-windows and the optimiser steps on each one. `--eval-every N` validates and checkpoints inside an
-epoch, which matters when an epoch is hours long.
+windows and the optimiser steps on each one. `--warmup`, `--max-steps`, `--eval-every`, `--log-every`
+and `--save-every` all count **optimizer updates**, including on resume. Logs separately report
+completed document batches and predicted tokens. The scheduler horizon counts the actual TBPTT
+windows in the length-bucketed batches, including partial batches, over `--epochs`; `--max-steps`
+is an optional stopping point within that schedule, not a replacement schedule horizon.
+
+`ckpt.pt` holds the best validation weights (latest evaluated weights when validation is empty).
+`last.pt` holds weights at a clean exit. `latest.pt` is the resumable checkpoint, saved atomically
+every `--save-every` updates (500 by default), at validation boundaries, and at a clean stop. It
+includes Adam and scheduler state, RNG states, counters, dataset identity, the next data cursor,
+and the recurrent state and token history when stopped inside a batch. SIGINT/SIGTERM request a
+stop after the current optimizer update. A hard kill can lose work since the last completed save.
+
+```bash
+python train.py --graph graph_cb/graph.npz --data data/tinystories --out runs/A \
+    --resume runs/A/latest.pt
+```
+
+Resume restores the original training recipe. Paths, device, stopping limit and logging/checkpoint
+intervals may be changed; changing the model, batch/sequence lengths, epochs or learning-rate recipe
+requires `--init-from` instead. Dataset contents are hashed at startup and must match on resume.
+Logging/checkpoint intervals are inherited unless overridden. Omit `--max-steps` on resume to
+finish the original epoch budget, or pass a new absolute optimizer-update stopping point.
+Keep the run's tokenizer and best checkpoint with `latest.pt`. Exact numerical replay is tested on
+CPU; CUDA reproducibility also depends on the kernels, hardware and runtime. Older weights-only
+checkpoints remain usable with `--init-from`, but cannot reconstruct a previous optimizer state.
+
+Run focused offline regressions with `python -m unittest discover -s tests -v`, and the complete
+training/export/loading pipeline with `tests/smoke.sh`.
 
 ## Sample
 

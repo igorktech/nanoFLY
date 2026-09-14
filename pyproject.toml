@@ -14,7 +14,7 @@ dependencies = ["torch>=2.2", "numpy", "tokenizers"]
 [project.optional-dependencies]
 hf = ["transformers>=4.45", "safetensors", "huggingface_hub"]
 encoder = ["sentence-transformers>=3.3"]
-data = ["pandas", "pyarrow", "scipy", "certifi", "zstandard"]
+data = ["pandas", "pyarrow", "scipy", "certifi", "zstandard", "huggingface_hub"]
 vision = ["pillow"]
 dev = ["nanofly[hf,encoder,data]"]
 

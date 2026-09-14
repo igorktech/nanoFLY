@@ -18,6 +18,8 @@ import json
 import math
 import os
 import random
+import tempfile
+import warnings
 
 import numpy as np
 import torch
@@ -68,7 +70,9 @@ def get_tokenizer(path, texts, vocab_size, kind="bpe", alphabet=CHAR_ALPHABET):
     """Load `path` if it exists, otherwise train on `texts` and save it there."""
     from tokenizers import Tokenizer
     if path and os.path.exists(path):
-        return Tokenizer.from_file(path)
+        tok = Tokenizer.from_file(path)
+        validate_tokenizer(tok)
+        return tok
     if kind == "char":
         tok = char_tokenizer(alphabet)
         unknown = sorted({c for t in texts for c in t.lower() if tok.token_to_id(c) is None})
@@ -79,6 +83,24 @@ def get_tokenizer(path, texts, vocab_size, kind="bpe", alphabet=CHAR_ALPHABET):
     if path:
         tok.save(path)
     return tok
+
+
+def validate_tokenizer(tok):
+    if [tok.token_to_id(t) for t in SPECIAL_TOKENS] != [PAD, BOS, EOS]:
+        raise ValueError("tokenizer must use <pad>=0, <s>=1, </s>=2")
+    ids = list(tok.get_vocab().values())
+    if not ids or min(ids) < 0 or max(ids) >= min(MAX_VOCAB, tok.get_vocab_size()):
+        raise ValueError("tokenizer ids must be dense and fit in uint16")
+
+
+def data_sha256(path):
+    """Content identity, including token IDs and offsets, independent of the dataset's location."""
+    names = ("train.bin", "val.bin", "train_offsets.npy", "val_offsets.npy")
+    paths = [os.path.join(path, n) for n in names] if os.path.isdir(path) else [path]
+    h = hashlib.sha256()
+    for filename in paths:
+        h.update(file_sha256(filename).encode())
+    return h.hexdigest()
 
 
 # ------------------------------------------------------------------------------------ token stream
@@ -104,8 +126,13 @@ class TokenStream:
 
     @classmethod
     def from_dir(cls, d, split, max_len=0):
-        ids = np.memmap(os.path.join(d, f"{split}.bin"), dtype=np.uint16, mode="r")
-        offsets = np.load(os.path.join(d, f"{split}_offsets.npy"))
+        path = os.path.join(d, f"{split}.bin")
+        ids = np.memmap(path, dtype=np.uint16, mode="r") if os.path.getsize(path) else np.empty(0, np.uint16)
+        offsets = np.load(os.path.join(d, f"{split}_offsets.npy"), mmap_mode="r")
+        if (offsets.ndim != 1 or offsets.dtype != np.int64 or not len(offsets)
+                or offsets[0] != 0 or offsets[-1] != len(ids)
+                or np.any(np.diff(offsets) < 2)):
+            raise ValueError(f"invalid {split} offsets: expected documents of at least two tokens")
         return cls(ids, offsets, max_len=max_len)
 
     @classmethod
@@ -162,52 +189,91 @@ class TokenStream:
 
 # ------------------------------------------------------------------------------------- preparation
 
-def _encode_documents(tok, texts, chunk=0, batch=8192):
-    """Texts -> token sequences. `chunk` splits a long document into windows of that many tokens,
-    each becoming its own example — a book is not one training example, and neither is a story
-    longer than the loop's `--max-len`."""
-    body = max(chunk - 2, 1) if chunk else 0
-    for s in range(0, len(texts), batch):
-        for enc in tok.encode_batch(texts[s:s + batch]):
-            ids = enc.ids
-            if not ids:
-                continue
-            if body:
-                for c in range(0, len(ids), body):
-                    yield [BOS] + ids[c:c + body] + [EOS]
-            else:
-                yield [BOS] + ids + [EOS]
+def _encode_documents(tok, texts, chunk=0):
+    """Encode one document at a time; zero chunk keeps its full recurrent context."""
+    if chunk and chunk < 3:
+        raise ValueError("chunk must be 0 or at least 3 (BOS + text + EOS)")
+    for text in texts:
+        ids = tok.encode(text).ids
+        if not ids:
+            continue
+        if chunk:
+            for c in range(0, len(ids), chunk - 2):
+                yield [BOS] + ids[c:c + chunk - 2] + [EOS]
+        else:
+            yield [BOS] + ids + [EOS]
+
+
+def iter_spool(path):
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            yield json.loads(line)
 
 
 def write_prepared(out, texts_train, texts_val, vocab=1024, kind="bpe", alphabet=CHAR_ALPHABET,
-                   tokenizer=None, chunk=0, tok_limit=300_000, source="", force=False):
-    """Write a prepared directory: tokenizer, `<split>.bin`, `<split>_offsets.npy`, `meta.json`."""
+                   tokenizer=None, chunk=0, tok_limit=300_000, source="", force=False,
+                   tok_chars=20_000_000, seed=0):
+    """Spool training text to disk, fit BPE on a bounded reservoir, then stream uint16 IDs.
+
+    RAM is bounded by the tokenizer sample and the largest individual document. Temporary disk
+    holds the training text; neither the corpus nor its growing offsets are collected in RAM.
+    """
+    if tok_limit < 1 or tok_chars < 1 or (chunk and chunk < 3):
+        raise ValueError("positive tokenizer limits and chunk=0 or chunk>=3 required")
     os.makedirs(out, exist_ok=True)
     tok_path = tokenizer or os.path.join(out, "tokenizer.json")
     if force and not tokenizer and os.path.exists(tok_path):
         os.remove(tok_path)
-    tok = get_tokenizer(tok_path, texts_train[:tok_limit], vocab, kind, alphabet)
-    if tok.get_vocab_size() > MAX_VOCAB:
-        raise SystemExit(f"vocabulary {tok.get_vocab_size()} does not fit in uint16")
-    if os.path.abspath(tok_path) != os.path.abspath(os.path.join(out, "tokenizer.json")):
-        tok.save(os.path.join(out, "tokenizer.json"))
-
-    counts = {}
-    for split, texts in (("train", texts_train), ("val", texts_val)):
-        offsets = [0]
-        with open(os.path.join(out, f"{split}.bin"), "wb") as f:
-            for seq in _encode_documents(tok, texts, chunk):
-                f.write(np.asarray(seq, dtype=np.uint16).tobytes())
-                offsets.append(offsets[-1] + len(seq))
-        np.save(os.path.join(out, f"{split}_offsets.npy"), np.asarray(offsets, dtype=np.int64))
-        counts[split] = (len(offsets) - 1, offsets[-1])
-        print(f"  {split}: {counts[split][0]:,} examples, {counts[split][1]:,} tokens")
-
-    chars = sum(len(t) for t in texts_train)
+    # Fixed-size snippets make the reservoir bounded even for arbitrarily long documents.
+    snippet_chars = min(2048, tok_chars)
+    sample_size = min(tok_limit, max(1, tok_chars // snippet_chars))
+    rng = random.Random(seed)
+    sample, chars, n_docs = [], 0, 0
+    with tempfile.TemporaryDirectory(prefix=".prepare-", dir=out) as tmp:
+        spool = os.path.join(tmp, "train.jsonl")
+        with open(spool, "w", encoding="utf-8") as f:
+            for text in texts_train:
+                if not text.strip():
+                    continue
+                f.write(json.dumps(text, ensure_ascii=False) + "\n")
+                chars += len(text)
+                n_docs += 1
+                j = rng.randrange(n_docs)
+                if len(sample) < sample_size or j < sample_size:
+                    start = rng.randrange(max(1, len(text) - snippet_chars + 1))
+                    snippet = text[start:start + snippet_chars]
+                    if len(sample) < sample_size:
+                        sample.append(snippet)
+                    else:
+                        sample[j] = snippet
+        if not n_docs:
+            raise ValueError("no training documents; check the field, limits, and validation fraction")
+        tok = get_tokenizer(tok_path, sample, vocab, kind, alphabet)
+        validate_tokenizer(tok)
+        sample_chars = sum(map(len, sample))
+        del sample
+        if os.path.abspath(tok_path) != os.path.abspath(os.path.join(out, "tokenizer.json")):
+            tok.save(os.path.join(out, "tokenizer.json"))
+        counts = {}
+        for split, texts in (("train", iter_spool(spool)), ("val", texts_val)):
+            raw_offsets = os.path.join(tmp, "offsets.bin")
+            n, total = 0, 0
+            with open(os.path.join(out, f"{split}.bin"), "wb") as f, open(raw_offsets, "wb") as off:
+                off.write(np.int64(0).tobytes())
+                for seq in _encode_documents(tok, texts, chunk):
+                    f.write(np.asarray(seq, dtype=np.uint16).tobytes())
+                    total += len(seq)
+                    n += 1
+                    off.write(np.int64(total).tobytes())
+            offsets = np.memmap(raw_offsets, dtype=np.int64, mode="r")
+            np.save(os.path.join(out, f"{split}_offsets.npy"), offsets)
+            del offsets
+            counts[split] = n, total
+            print(f"  {split}: {n:,} examples, {total:,} tokens")
     meta = {
         "source": source, "vocab_size": tok.get_vocab_size(), "tokenizer": "tokenizer.json",
         "tokenizer_kind": kind, "tokenizer_sha256": file_sha256(os.path.join(out, "tokenizer.json")),
-        "chunk": chunk,
+        "chunk": chunk, "seed": seed, "tokenizer_sample_chars": sample_chars,
         "n_train": counts["train"][0], "n_val": counts["val"][0],
         "tokens_train": counts["train"][1], "tokens_val": counts["val"][1],
         "chars_per_token": round(chars / max(counts["train"][1], 1), 2),
@@ -271,6 +337,15 @@ def load_data(args):
             raise SystemExit(f"tokenizer not found: {tok_path}")
         from tokenizers import Tokenizer
         tok = Tokenizer.from_file(tok_path)
+        validate_tokenizer(tok)
+        meta_path = os.path.join(args.data, "meta.json")
+        if not os.path.exists(meta_path):
+            raise ValueError("prepared data needs meta.json with tokenizer_sha256; prepare it again")
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        if not meta.get("tokenizer_sha256") or file_sha256(tok_path) != meta["tokenizer_sha256"]:
+            raise ValueError("prepared data tokenizer mismatch: token IDs belong to another tokenizer; "
+                             "re-prepare the corpus with the checkpoint tokenizer")
         train = TokenStream.from_dir(args.data, "train", args.max_len)
         val = TokenStream.from_dir(args.data, "val", args.max_len)
         if args.limit:
@@ -284,7 +359,8 @@ def load_data(args):
         print(f"examples: {len(texts):,}")
         tok_path = args.tokenizer or out_tok
         tok = get_tokenizer(tok_path, texts, args.vocab, args.vocab_type, args.alphabet)
-        seqs = [[BOS] + e.ids[:args.max_len - 2] + [EOS] for e in tok.encode_batch(texts)]
+        validate_tokenizer(tok)
+        seqs = [[BOS] + e.ids + [EOS] for e in tok.encode_batch(texts)]
         n_val = int(len(seqs) * args.val_frac) if len(seqs) > 50 else 0
         perm = np.random.default_rng(args.seed).permutation(len(seqs))
         val_i, train_i = perm[:n_val].tolist(), perm[n_val:].tolist()
@@ -293,6 +369,17 @@ def load_data(args):
     else:
         raise SystemExit(f"--data {args.data}: expected a prepared directory or a .jsonl/.txt file")
 
+    validate_tokenizer(tok)
+    if not len(train):
+        raise ValueError("training split is empty")
+    for name, stream in (("train", train), ("val", val)):
+        if args.max_len:
+            original = np.diff(stream.offsets)
+            lost = int(np.maximum(original - args.max_len, 0).sum())
+            if lost:
+                warnings.warn(f"{name}: explicit --max-len={args.max_len} truncates "
+                              f"{lost:,} tokens; use --max-len 0 to keep full documents "
+                              "or prepare with --chunk to retain all text")
     os.makedirs(args.out, exist_ok=True)
     if os.path.abspath(tok_path) != os.path.abspath(out_tok):
         tok.save(out_tok)
